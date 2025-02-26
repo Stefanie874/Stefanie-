@@ -1,4 +1,542 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler
+from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import xgboost as XGBRegressor
+import re
+import time
 import os
+import joblib
+import argparse
+import sys
+
+class RTLLogicDepthPredictor:
+    """
+    A class to predict combinational logic depth of signals in RTL modules
+    without running a complete synthesis.
+    """
+    
+    def __init__(self):
+        self.model = None
+        self.feature_extractor = None
+        self.scaler = None
+        
+    def extract_features_from_rtl(self, rtl_module, target_signal):
+        """
+        Extract features from an RTL module for a specific target signal.
+        
+        Args:
+            rtl_module (str): Path to the RTL module file or content as string
+            target_signal (str): Name of the signal to analyze
+            
+        Returns:
+            dict: Dictionary of extracted features
+        """
+        # Read RTL content if it's a file path
+        if os.path.exists(rtl_module):
+            with open(rtl_module, 'r') as file:
+                rtl_content = file.read()
+        else:
+            rtl_content = rtl_module
+            
+        features = {}
+        
+        # Extract basic features
+        features['signal_name_length'] = len(target_signal)
+        features['rtl_size'] = len(rtl_content)
+        
+        # Count signal occurrences
+        features['signal_occurrences'] = rtl_content.count(target_signal)
+        
+        # Extract fan-in approximation (signals that feed into the target)
+        signal_pattern = re.compile(r'assign\s+{}\s*=\s*([^;]+);'.format(re.escape(target_signal)))
+        assign_match = signal_pattern.search(rtl_content)
+        
+        if assign_match:
+            rhs = assign_match.group(1)
+            # Count unique signals (words) in the right-hand side
+            unique_signals = set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', rhs))
+            features['fan_in_count'] = len(unique_signals)
+            
+            # Count operators (complexity indicator)
+            features['and_ops'] = rhs.count('&')
+            features['or_ops'] = rhs.count('|')
+            features['xor_ops'] = rhs.count('^')
+            features['not_ops'] = rhs.count('~')
+            features['add_ops'] = rhs.count('+')
+            features['sub_ops'] = rhs.count('-')
+            features['total_ops'] = (features['and_ops'] + features['or_ops'] + 
+                                    features['xor_ops'] + features['not_ops'] +
+                                    features['add_ops'] + features['sub_ops'])
+                                    
+            # Detect conditional expressions (often create MUXes)
+            features['conditional_ops'] = rhs.count('?')
+            
+            # Detect parenthesis nesting level (expression complexity)
+            max_nesting = 0
+            current_nesting = 0
+            for char in rhs:
+                if char == '(':
+                    current_nesting += 1
+                    max_nesting = max(max_nesting, current_nesting)
+                elif char == ')':
+                    current_nesting -= 1
+            features['max_nesting'] = max_nesting
+        else:
+            # Handle case where target signal isn't a simple assign
+            always_block_pattern = re.compile(r'always\s*@[^\n]+\n[^;]*{}\s*[<:]='.format(re.escape(target_signal)))
+            always_match = always_block_pattern.search(rtl_content)
+            
+            if always_match:
+                # It's in an always block, extract the surrounding block
+                features['in_always_block'] = 1
+                # Extract approximate complexity from always block
+                surrounding_text = rtl_content[max(0, always_match.start()-100):min(len(rtl_content), always_match.end()+500)]
+                features['fan_in_count'] = len(set(re.findall(r'\b[a-zA-Z_][a-zA-Z0-9_]*\b', surrounding_text))) - 1  # Subtract 1 for target
+                features['and_ops'] = surrounding_text.count('&')
+                features['or_ops'] = surrounding_text.count('|')
+                features['xor_ops'] = surrounding_text.count('^')
+                features['not_ops'] = surrounding_text.count('~')
+                features['add_ops'] = surrounding_text.count('+')
+                features['sub_ops'] = surrounding_text.count('-')
+                features['total_ops'] = (features['and_ops'] + features['or_ops'] + 
+                                        features['xor_ops'] + features['not_ops'] +
+                                        features['add_ops'] + features['sub_ops'])
+                features['conditional_ops'] = surrounding_text.count('?') + surrounding_text.count('if') + surrounding_text.count('case')
+                features['max_nesting'] = 2  # Default assumption
+            else:
+                # Can't easily determine - use defaults
+                features['in_always_block'] = 0
+                features['fan_in_count'] = 1
+                features['and_ops'] = 0
+                features['or_ops'] = 0
+                features['xor_ops'] = 0
+                features['not_ops'] = 0
+                features['add_ops'] = 0
+                features['sub_ops'] = 0
+                features['total_ops'] = 0
+                features['conditional_ops'] = 0
+                features['max_nesting'] = 0
+        
+        # Extract fan-out (signals that use this signal)
+        fan_out_pattern = re.compile(r'[^a-zA-Z0-9_]{}[^a-zA-Z0-9_]'.format(re.escape(target_signal)))
+        fan_out_matches = fan_out_pattern.findall(rtl_content)
+        features['fan_out_approx'] = len(fan_out_matches)
+        
+        # Module complexity indicators
+        features['module_flop_count'] = rtl_content.count('reg ') + rtl_content.count('always @(posedge')
+        features['module_input_count'] = rtl_content.count('input ')
+        features['module_output_count'] = rtl_content.count('output ')
+        
+        return features
+    
+    def prepare_training_data(self, datasets):
+        """
+        Prepare training data from a collection of datasets
+        
+        Args:
+            datasets (list): List of dictionaries containing RTL, signal and actual depth
+                            [{'rtl': 'module...', 'signal': 'sig_name', 'depth': 5}, ...]
+                             
+        Returns:
+            tuple: X (features) and y (depths) for model training
+        """
+        X_data = []
+        y_data = []
+        
+        for data in datasets:
+            rtl = data['rtl']
+            signal = data['signal']
+            depth = data['depth']
+            
+            features = self.extract_features_from_rtl(rtl, signal)
+            X_data.append(features)
+            y_data.append(depth)
+            
+        # Convert to DataFrame for easier handling
+        X = pd.DataFrame(X_data)
+        y = np.array(y_data)
+        
+        return X, y
+    
+    def train(self, X, y, model_type='ensemble'):
+        """
+        Train the model to predict logic depth.
+        
+        Args:
+            X (DataFrame): Features
+            y (array): Target depths
+            model_type (str): Type of model to use ('rf', 'xgb', 'ensemble')
+            
+        Returns:
+            float: Model performance metrics
+        """
+        # Split the data
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        
+        # Create pipelines with preprocessing
+        self.scaler = StandardScaler()
+        
+        if model_type == 'rf':
+            self.model = RandomForestRegressor(n_estimators=100, random_state=42)
+            # Simple parameters for faster training
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [None, 10]
+            }
+        elif model_type == 'xgb':
+            self.model = XGBRegressor(n_estimators=100, random_state=42)
+            # Simple parameters for faster training
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [3, 5]
+            }
+        else:  # ensemble
+            # Default to GradientBoostingRegressor
+            self.model = GradientBoostingRegressor(n_estimators=100, random_state=42)
+            # Simple parameters for faster training
+            param_grid = {
+                'n_estimators': [50, 100],
+                'max_depth': [3]
+            }
+            
+        # Grid search for hyperparameter tuning
+        grid_search = GridSearchCV(
+            self.model, param_grid, cv=3, scoring='neg_mean_absolute_error'
+        )
+        
+        # Time the training process
+        start_time = time.time()
+        grid_search.fit(X_train, y_train)
+        training_time = time.time() - start_time
+        
+        # Get the best model
+        self.model = grid_search.best_estimator_
+        
+        # Evaluate on test set
+        y_pred = self.model.predict(X_test)
+        
+        # Calculate metrics
+        mae = mean_absolute_error(y_test, y_pred)
+        mse = mean_squared_error(y_test, y_pred)
+        rmse = np.sqrt(mse)
+        r2 = r2_score(y_test, y_pred)
+        
+        # Print results
+        print(f"Model: {model_type}")
+        print(f"Best Parameters: {grid_search.best_params_}")
+        print(f"Training Time: {training_time:.2f} seconds")
+        print(f"Mean Absolute Error: {mae:.2f}")
+        print(f"Root Mean Squared Error: {rmse:.2f}")
+        print(f"R² Score: {r2:.2f}")
+        
+        # Return metrics as a dictionary
+        return {
+            'model_type': model_type,
+            'best_params': grid_search.best_params_,
+            'training_time': training_time,
+            'mae': mae,
+            'rmse': rmse,
+            'r2': r2,
+            'test_actual': y_test,
+            'test_predicted': y_pred
+        }
+    
+    def predict(self, rtl_module, target_signal):
+        """
+        Predict the combinational logic depth for a target signal
+        
+        Args:
+            rtl_module (str): Path to RTL file or RTL content
+            target_signal (str): Name of the signal to analyze
+            
+        Returns:
+            float: Predicted logic depth
+        """
+        if self.model is None:
+            raise ValueError("Model is not trained. Call train() first.")
+        
+        # Extract features
+        start_time = time.time()
+        features = self.extract_features_from_rtl(rtl_module, target_signal)
+        feature_time = time.time() - start_time
+        
+        # Convert to DataFrame
+        X = pd.DataFrame([features])
+        
+        # Scale features if needed
+        if hasattr(self.model, 'named_steps') and 'scaler' in self.model.named_steps:
+            X_scaled = self.model.named_steps['scaler'].transform(X)
+            X_pred = pd.DataFrame(X_scaled, columns=X.columns)
+        else:
+            X_pred = X
+        
+        # Predict
+        start_time = time.time()
+        depth = self.model.predict(X_pred)[0]
+        predict_time = time.time() - start_time
+        
+        # Round to nearest integer (as depth is usually an integer)
+        rounded_depth = round(depth)
+        
+        print(f"Feature Extraction Time: {feature_time:.4f} seconds")
+        print(f"Prediction Time: {predict_time:.4f} seconds")
+        print(f"Total Time: {feature_time + predict_time:.4f} seconds")
+        print(f"Predicted Logic Depth: {depth:.2f} -> {rounded_depth}")
+        
+        # Return both raw and rounded prediction
+        return {
+            'raw_depth': depth,
+            'rounded_depth': rounded_depth,
+            'feature_time': feature_time,
+            'predict_time': predict_time,
+            'features': features
+        }
+    
+    def save_model(self, filename):
+        """Save the trained model to file"""
+        if self.model is None:
+            raise ValueError("No trained model to save")
+        joblib.dump(self.model, filename)
+        
+    def load_model(self, filename):
+        """Load a trained model from file"""
+        self.model = joblib.load(filename)
+
+def generate_synthetic_data(num_samples=100):
+    """Generate synthetic RTL data for training"""
+    import random
+    
+    # Start with a few manually crafted examples for structure
+    synthetic_data = [
+        {
+            'rtl': """
+            module simple_adder(
+                input [7:0] a, b,
+                output [8:0] sum
+            );
+                assign sum = a + b;
+            endmodule
+            """,
+            'signal': 'sum',
+            'depth': 3
+        },
+        {
+            'rtl': """
+            module multiplexer(
+                input sel,
+                input [7:0] a, b,
+                output [7:0] out
+            );
+                assign out = sel ? a : b;
+            endmodule
+            """,
+            'signal': 'out',
+            'depth': 2
+        },
+        {
+            'rtl': """
+            module complex_logic(
+                input [7:0] a, b, c, d,
+                output [7:0] result
+            );
+                assign result = ((a & b) | (c ^ d)) + (a - b);
+            endmodule
+            """,
+            'signal': 'result',
+            'depth': 5
+        },
+        {
+            'rtl': """
+            module sequential_logic(
+                input clk, rst,
+                input [7:0] data_in,
+                output reg [7:0] data_out
+            );
+                always @(posedge clk or posedge rst) begin
+                    if (rst)
+                        data_out <= 8'b0;
+                    else
+                        data_out <= data_in + 8'b1;
+                end
+            endmodule
+            """,
+            'signal': 'data_out',
+            'depth': 2
+        },
+        {
+            'rtl': """
+            module nested_logic(
+                input [7:0] a, b, c, d, e, f,
+                output [7:0] result
+            );
+                assign result = ((a & (b | c)) ^ (d & (e | f))) + ((a + b) * (c - d));
+            endmodule
+            """,
+            'signal': 'result',
+            'depth': 8
+        }
+    ]
+    
+    # Generate more synthetic examples with variations
+    for i in range(num_samples - len(synthetic_data)):
+        op_count = random.randint(1, 10)
+        operations = []
+        signals = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'][:random.randint(2, 8)]
+        
+        # Generate random operations
+        for _ in range(op_count):
+            op_type = random.choice(['&', '|', '^', '+', '-', '*'])
+            operands = random.sample(signals, 2)
+            operations.append(f"({operands[0]} {op_type} {operands[1]})")
+        
+        # Create RTL with these operations
+        result_expr = operations[0]
+        for op in operations[1:]:
+            combine_op = random.choice(['&', '|', '^', '+', '-'])
+            result_expr = f"({result_expr} {combine_op} {op})"
+        
+        rtl = f"""
+        module synthetic_{i}(
+            input [{len(signals)*8-1}:0] {'_'.join(signals)},
+            output [7:0] result
+        );
+            assign result = {result_expr};
+        endmodule
+        """
+        
+        # Approximate depth based on operation count and nesting
+        depth = min(20, max(1, int(op_count * random.uniform(0.8, 1.2))))
+        
+        synthetic_data.append({
+            'rtl': rtl,
+            'signal': 'result',
+            'depth': depth
+        })
+    
+    return synthetic_data
+
+def main():
+    parser = argparse.ArgumentParser(description='RTL Logic Depth Predictor')
+    subparsers = parser.add_subparsers(dest='command', help='Command to run')
+    
+    # Train command
+    train_parser = subparsers.add_parser('train', help='Train a new model')
+    train_parser.add_argument('--model_type', choices=['rf', 'xgb', 'ensemble'], default='ensemble',
+                             help='Type of model to train')
+    train_parser.add_argument('--output', default='rtl_depth_model.joblib',
+                             help='Output file for the trained model')
+    train_parser.add_argument('--samples', type=int, default=100,
+                             help='Number of synthetic samples to generate for training')
+    
+    # Predict command
+    predict_parser = subparsers.add_parser('predict', help='Predict logic depth for a signal')
+    predict_parser.add_argument('--model', required=True,
+                               help='Path to the trained model file')
+    predict_parser.add_argument('--rtl', required=True,
+                               help='Path to the RTL file or RTL content')
+    predict_parser.add_argument('--signal', required=True,
+                               help='Name of the signal to analyze')
+    predict_parser.add_argument('--verbose', action='store_true',
+                               help='Print detailed information')
+    
+    args = parser.parse_args()
+    
+    predictor = RTLLogicDepthPredictor()
+    
+    if args.command == 'train':
+        print(f"Generating {args.samples} synthetic training samples...")
+        synthetic_data = generate_synthetic_data(args.samples)
+        
+        print("Extracting features...")
+        X, y = predictor.prepare_training_data(synthetic_data)
+        
+        print(f"Training {args.model_type} model...")
+        metrics = predictor.train(X, y, model_type=args.model_type)
+        
+        print(f"Saving model to {args.output}...")
+        predictor.save_model(args.output)
+        print("Training complete!")
+        
+    elif args.command == 'predict':
+        print(f"Loading model from {args.model}...")
+        predictor.load_model(args.model)
+        
+        print(f"Reading RTL from {args.rtl}...")
+        if not os.path.exists(args.rtl):
+            print("Error: RTL file not found")
+            return
+            
+        print(f"Predicting logic depth for signal '{args.signal}'...")
+        result = predictor.predict(args.rtl, args.signal)
+        
+        print("\n--- PREDICTION RESULTS ---")
+        print(f"Signal: {args.signal}")
+        print(f"Predicted Logic Depth: {result['rounded_depth']}")
+        print(f"Confidence (Raw Value): {result['raw_depth']:.2f}")
+        print(f"Prediction Time: {result['feature_time'] + result['predict_time']:.4f} seconds")
+        
+        if args.verbose:
+            print("\nExtracted Features:")
+            for feat, value in result['features'].items():
+                print(f"  {feat}: {value}")
+    
+    else:
+        parser.print_help()
+
+def easy_predict(rtl_content, signal_name, model_path=None):
+    """
+    Simplified function to predict logic depth from RTL content
+    
+    Args:
+        rtl_content (str): The RTL code as a string
+        signal_name (str): The signal to analyze
+        model_path (str): Path to a pre-trained model, or None to train a new one
+        
+    Returns:
+        int: Predicted logic depth
+    """
+    predictor = RTLLogicDepthPredictor()
+    
+    if model_path and os.path.exists(model_path):
+        # Load existing model
+        predictor.load_model(model_path)
+    else:
+        # Train a new model
+        print("Training a new model...")
+        synthetic_data = generate_synthetic_data(100)
+        X, y = predictor.prepare_training_data(synthetic_data)
+        predictor.train(X, y)
+        
+        # Save the model for future use
+        if model_path:
+            predictor.save_model(model_path)
+    
+    # Make prediction
+    result = predictor.predict(rtl_content, signal_name)
+    return result['rounded_depth']
+
+if __name__ == "__main__":
+    # If run as a script, use the command-line interface
+    if len(sys.argv) > 1:
+        main()
+    else:
+        # Simple example for direct import usage
+        rtl_example = """
+        module example(
+            input [7:0] a, b,
+            output [7:0] out
+        );
+            assign out = (a & b) | (a ^ b);
+        endmodule
+        """
+        
+        depth = easy_predict(rtl_example, 'out')
+        print(f"Example prediction: Logic depth for 'out' is {depth}")import os
 import re
 import pandas as pd
 import numpy as np
