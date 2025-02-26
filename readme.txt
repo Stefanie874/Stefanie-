@@ -1,126 +1,120 @@
 # RTL Logic Depth Predictor
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-
-A machine learning-based tool that predicts the combinational logic depth of signals in RTL (Register Transfer Level) Verilog code without requiring full synthesis. This tool helps hardware designers identify potential timing bottlenecks early in the design process.
+A machine learning-based tool that predicts the combinational logic depth of signals in RTL modules without running a complete synthesis.
 
 ## Overview
 
-Hardware designers often need to estimate critical path delays in their designs before running a full synthesis flow. The RTL Logic Depth Predictor analyzes Verilog code and predicts the combinational logic depth of signals based on various code features, providing insights into potential timing issues.
+The RTL Logic Depth Predictor uses machine learning models to estimate the combinational logic depth of signals in RTL (Register Transfer Level) modules. This can be useful for early performance estimation and design optimization without the need for complete synthesis, which can be time-consuming for large designs.
 
-Key features:
-- Extract relevant features from Verilog RTL code
-- Predict combinational logic depth using either ML models or heuristics
-- Identify potential timing bottlenecks
-- Analyze fan-in and fan-out relationships
-- Train custom models on your specific design patterns
+## Features
+
+- Extracts relevant features from RTL code to predict logic depth
+- Supports multiple machine learning models (Random Forest, XGBoost, Gradient Boosting)
+- Command-line interface for training models and making predictions
+- Supports both file-based and string-based RTL inputs
+- Provides detailed prediction metrics and analysis
 
 ## Installation
 
-### Requirements
+### Prerequisites
 
 - Python 3.6+
+- NumPy
 - pandas
-- numpy
-- scikit-learn
 - matplotlib
+- seaborn
+- scikit-learn
+- XGBoost
 - joblib
 
-### Setup
+### Install Dependencies
 
-1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/rtl-logic-depth-predictor.git
-cd rtl-logic-depth-predictor
-```
-
-2. Install required packages:
-```bash
-pip install pandas numpy scikit-learn matplotlib joblib
+pip install numpy pandas matplotlib seaborn scikit-learn xgboost joblib
 ```
 
 ## Usage
 
-### Basic Usage
-
-Analyze a Verilog file to predict logic depth for all signals:
-
-```bash
-python rtl_logic_depth_predictor.py --rtl path/to/your/file.v
-```
-
-Analyze a specific signal in a Verilog file:
-
-```bash
-python rtl_logic_depth_predictor.py --rtl path/to/your/file.v --signal signal_name
-```
-
 ### Training a Model
 
-Train a new model on synthetic data:
-
 ```bash
-python rtl_logic_depth_predictor.py --train --model custom_model.joblib
+python rtl_logic_depth_predictor.py train --model_type ensemble --output model.joblib --samples 200
 ```
 
-Use a trained model for prediction:
+Parameters:
+- `--model_type`: Type of model to train (options: 'rf', 'xgb', 'ensemble', default: 'ensemble')
+- `--output`: Output file for the trained model (default: 'rtl_depth_model.joblib')
+- `--samples`: Number of synthetic samples to generate for training (default: 100)
+
+### Making Predictions
 
 ```bash
-python rtl_logic_depth_predictor.py --rtl path/to/your/file.v --model custom_model.joblib
+python rtl_logic_depth_predictor.py predict --model model.joblib --rtl path/to/rtl_file.v --signal signal_name
+```
+
+Parameters:
+- `--model`: Path to the trained model file
+- `--rtl`: Path to the RTL file or RTL content
+- `--signal`: Name of the signal to analyze
+- `--verbose`: Flag to print detailed feature information
+
+### Using as a Library
+
+You can also use the predictor programmatically:
+
+```python
+from rtl_logic_depth_predictor import easy_predict
+
+rtl_content = """
+module example(
+    input [7:0] a, b,
+    output [7:0] out
+);
+    assign out = (a & b) | (a ^ b);
+endmodule
+"""
+
+depth = easy_predict(rtl_content, 'out', 'model.joblib')
+print(f"Logic depth for 'out' is {depth}")
 ```
 
 ## How It Works
 
-The tool extracts the following features from RTL code:
+1. **Feature Extraction**: The predictor extracts relevant features from RTL code, including:
+   - Signal occurrences and characteristics
+   - Logic operations (AND, OR, XOR, etc.)
+   - Expression complexity (nesting levels)
+   - Fan-in and fan-out approximations
+   - Module complexity indicators
 
-1. **Operation Count**: Number of operations in the signal definition
-2. **Fan-in**: Number of signals feeding into the target signal
-3. **Fan-out**: Number of signals dependent on the target signal
-4. **Nesting Depth**: Maximum depth of nested operations
-5. **Conditional Statements**: Count of conditional constructs (if, case, ternary)
-6. **Arithmetic Operations**: Count of arithmetic operators (+, -, *, /, %)
-7. **Logical Operations**: Count of logical operators (&, |, ^, etc.)
-8. **Signal Name Complexity**: Length of signal name
-9. **Module Complexity**: Size and line count of the module
-10. **Assignment Complexity**: Complexity of assignments
-11. **Mux Complexity**: Count of ternary operators (? :)
-12. **Bit Width**: Estimated width of the signal
-13. **Function Calls**: Count of function calls in the signal definition
+2. **Model Training**: The extracted features are used to train a machine learning model using either synthetic data or real examples with known depths.
 
-These features are then used by a machine learning model (RandomForest or GradientBoosting) to predict the combinational logic depth. If no trained model is available, a heuristic estimation is used.
+3. **Prediction**: For new RTL signals, the predictor extracts features and uses the trained model to predict the combinational logic depth.
 
-## Example Output
+## Example
 
+```bash
+# Train a model with 200 synthetic samples
+python rtl_logic_depth_predictor.py train --samples 200 --output my_model.joblib
+
+# Predict logic depth for a signal in an RTL file
+python rtl_logic_depth_predictor.py predict --model my_model.joblib --rtl designs/alu.v --signal result
 ```
-Analysis results:
-------------------------------------------------------------
-Signal          Depth   Fan-In  Fan-Out
-------------------------------------------------------------
-data_out        8       3       0
-temp1           4       2       1
-temp2           4       2       1
-intermediate    3       1       1
-valid_out       2       1       0
 
-Potential timing bottlenecks (high depth and fan-out):
-data_out: Depth=8, Fan-out=0
-```
+## Limitations
+
+- Predictions are approximations and may not match exact synthesis results
+- Complex constructs (generate blocks, complex always blocks) may have reduced accuracy
+- The quality of predictions depends on the training data
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+Contributions are welcome! Areas for improvement include:
+- Better feature extraction for complex RTL constructs
+- Support for additional RTL languages (SystemVerilog, VHDL)
+- Integration with synthesis tools for validation
+- Expanding the training dataset with real-world examples
 
 ## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Acknowledgments
-
-- This tool uses machine learning techniques from scikit-learn
-- Thanks to the hardware design community for feedback and testing
+[MIT License](LICENSE)
